@@ -8,6 +8,7 @@
  * - PumpFun protocol functionality remains unchanged
  * - Added caching and batch RPC calls for improved performance
  * - Added --sell command to sell all holding tokens using Jupiter API
+ * - Added --balance command to check and manage SOL/WSOL balance
  * - NEW: Automated risk management system with target wallet monitoring
  * - NEW: Periodic selling system that sells all holdings every 2 minutes using Jupiter API
  * 
@@ -16,6 +17,7 @@
  * - cargo run -- --unwrap     : Unwrap WSOL back to SOL
  * - cargo run -- --close      : Close all empty token accounts
  * - cargo run -- --sell       : Sell all holding tokens using Jupiter API
+ * - cargo run -- --balance    : Check and manage SOL/WSOL balance
  * - cargo run -- --check-tokens : Check token tracking status
  * - cargo run -- --risk-check : Run manual risk management check (NEW!)
  * - cargo run                  : Start copy trading bot with risk management
@@ -30,12 +32,28 @@
  *    - Gets swap transaction from Jupiter Swap API
  *    - Signs and executes the transaction via RPC
  *    - Waits for confirmation
- * 5. Reports successful sales and total SOL received
+ * 5. Automatically triggers SOL/WSOL balance management
+ * 6. Reports successful sales and total SOL received
+ * 
+ * The --balance command performs SOL/WSOL balance management:
+ * 1. Checks current SOL and WSOL balances
+ * 2. Calculates if rebalancing is needed (default: 20% deviation from 50/50 split)
+ * 3. Automatically wraps SOL to WSOL or unwraps WSOL to SOL as needed
+ * 4. Ensures optimal balance for both Pump.fun (SOL) and other DEXes (WSOL)
  * 
  * Environment Variables:
  * - WRAP_AMOUNT: Amount of SOL to wrap (default: 0.1)
  * - RISK_MANAGEMENT_ENABLED: Enable/disable risk management (default: true)
  * - RISK_TARGET_TOKEN_THRESHOLD: Token threshold for risk alerts (default: 1000)
+ * - PERIODIC_SELLING_ENABLED: Enable/disable periodic selling (default: true)
+ * - PERIODIC_SELLING_INTERVAL_SECONDS: Interval for periodic selling (default: 120)
+ * 
+ * Balance Management:
+ * The system automatically maintains optimal SOL/WSOL ratios for different DEXes:
+ * - Pump.fun requires native SOL for trading
+ * - Other DEXes (Raydium, etc.) require WSOL for trading
+ * - Default target: 50% SOL / 50% WSOL with 20% deviation threshold
+ * - Triggered automatically after Jupiter selling or manually via --balance
  * - RISK_CHECK_INTERVAL_MINUTES: Risk check interval in minutes (default: 10)
  * - PERIODIC_SELLING_ENABLED: Enable/disable periodic selling (default: true)
  * - PERIODIC_SELLING_INTERVAL_SECONDS: Selling interval in seconds (default: 120)
@@ -283,13 +301,14 @@ async fn wrap_sol(config: &Config, amount: f64) -> Result<(), String> {
         ).map_err(|e| format!("Failed to create sync native instruction: {}", e))?
     );
     
-    // Send transaction using transaction landing mode
-    let recent_blockhash = config.app_state.rpc_client.get_latest_blockhash()
-        .map_err(|e| format!("Failed to get recent blockhash: {}", e))?;
+    // Send transaction using zeroslot for minimal latency
+    let recent_blockhash = match solana_vntr_sniper::services::blockhash_processor::BlockhashProcessor::get_latest_blockhash().await {
+        Some(hash) => hash,
+        None => return Err("Failed to get recent blockhash for SOL wrapping".to_string()),
+    };
     
-    match solana_vntr_sniper::core::tx::new_signed_and_send_with_landing_mode(
-        config.transaction_landing_mode.clone(),
-        &config.app_state,
+    match solana_vntr_sniper::core::tx::new_signed_and_send_zeroslot(
+        config.app_state.zeroslot_rpc_client.clone(),
         recent_blockhash,
         &config.app_state.wallet,
         instructions,
@@ -346,13 +365,14 @@ async fn unwrap_sol(config: &Config) -> Result<(), String> {
         &[&wallet_pubkey],
     ).map_err(|e| format!("Failed to create close account instruction: {}", e))?;
     
-    // Send transaction using transaction landing mode
-    let recent_blockhash = config.app_state.rpc_client.get_latest_blockhash()
-        .map_err(|e| format!("Failed to get recent blockhash: {}", e))?;
+    // Send transaction using zeroslot for minimal latency
+    let recent_blockhash = match solana_vntr_sniper::services::blockhash_processor::BlockhashProcessor::get_latest_blockhash().await {
+        Some(hash) => hash,
+        None => return Err("Failed to get recent blockhash for SOL unwrapping".to_string()),
+    };
     
-    match solana_vntr_sniper::core::tx::new_signed_and_send_with_landing_mode(
-        config.transaction_landing_mode.clone(),
-        &config.app_state,
+    match solana_vntr_sniper::core::tx::new_signed_and_send_zeroslot(
+        config.app_state.zeroslot_rpc_client.clone(),
         recent_blockhash,
         &config.app_state.wallet,
         vec![close_instruction],
@@ -435,13 +455,14 @@ async fn close_all_token_accounts(config: &Config) -> Result<(), String> {
             &[&wallet_pubkey],
         ).map_err(|e| format!("Failed to create close instruction for {}: {}", token_account, e))?;
         
-        // Send transaction using transaction landing mode
-        let recent_blockhash = config.app_state.rpc_client.get_latest_blockhash()
-            .map_err(|e| format!("Failed to get recent blockhash: {}", e))?;
+        // Send transaction using zeroslot for minimal latency
+        let recent_blockhash = match solana_vntr_sniper::services::blockhash_processor::BlockhashProcessor::get_latest_blockhash().await {
+            Some(hash) => hash,
+            None => return Err(format!("Failed to get recent blockhash for token account {}", token_account)),
+        };
         
-        match solana_vntr_sniper::core::tx::new_signed_and_send_with_landing_mode(
-            config.transaction_landing_mode.clone(),
-            &config.app_state,
+        match solana_vntr_sniper::core::tx::new_signed_and_send_zeroslot(
+            config.app_state.zeroslot_rpc_client.clone(),
             recent_blockhash,
             &config.app_state.wallet,
             vec![close_instruction],
@@ -775,38 +796,77 @@ async fn execute_swap_transaction(
         while attempts < max_attempts {
             attempts += 1;
             
-            // Send the transaction
-            match config.app_state.rpc_client.send_transaction(&transaction) {
-                Ok(signature) => {
-                    logger.log(format!("Versioned swap transaction sent: {}", signature));
-                    
-                    // Wait for confirmation
-                    for _ in 0..30 { // Wait up to 30 seconds for confirmation
-                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            // Try to convert versioned transaction to legacy transaction for zeroslot compatibility
+            if let Some(legacy_tx) = transaction.clone().into_legacy_transaction() {
+                // Send the legacy transaction using zeroslot for minimal latency
+                match config.app_state.zeroslot_rpc_client.send_transaction(&legacy_tx).await {
+                    Ok(signature) => {
+                        logger.log(format!("Versioned swap transaction sent via zeroslot: {}", signature));
                         
-                        if let Ok(status) = config.app_state.rpc_client.get_signature_status(&signature) {
-                            if let Some(result) = status {
-                                if result.is_ok() {
-                                    logger.log(format!("Versioned swap transaction confirmed: {}", signature));
-                                    return Ok(signature.to_string());
-                                } else {
-                                    return Err(format!("Transaction failed: {:?}", result));
+                        // Wait for confirmation
+                        for _ in 0..30 { // Wait up to 30 seconds for confirmation
+                            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                            
+                            if let Ok(status) = config.app_state.rpc_client.get_signature_status(&signature) {
+                                if let Some(result) = status {
+                                    if result.is_ok() {
+                                        logger.log(format!("Versioned swap transaction confirmed: {}", signature));
+                                        return Ok(signature.to_string());
+                                    } else {
+                                        return Err(format!("Transaction failed: {:?}", result));
+                                    }
                                 }
                             }
                         }
+                        
+                        return Err("Transaction confirmation timeout".to_string());
+                    },
+                    Err(e) => {
+                        logger.log(format!("Versioned swap attempt {}/{} failed: {}", attempts, max_attempts, e).red().to_string());
+                        
+                        if attempts >= max_attempts {
+                            return Err(format!("All versioned swap attempts failed. Last error: {}", e));
+                        }
+                        
+                        // Wait before retry
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                     }
-                    
-                    return Err("Transaction confirmation timeout".to_string());
-                },
-                Err(e) => {
-                    logger.log(format!("Versioned swap attempt {}/{} failed: {}", attempts, max_attempts, e).red().to_string());
-                    
-                    if attempts >= max_attempts {
-                        return Err(format!("All versioned swap attempts failed. Last error: {}", e));
+                }
+            } else {
+                // If conversion to legacy transaction fails, use normal RPC client as fallback
+                logger.log("Cannot convert versioned transaction to legacy, using normal RPC".yellow().to_string());
+                match config.app_state.rpc_client.send_transaction(&transaction) {
+                    Ok(signature) => {
+                        logger.log(format!("Versioned swap transaction sent via normal RPC: {}", signature));
+                        
+                        // Wait for confirmation
+                        for _ in 0..30 { // Wait up to 30 seconds for confirmation
+                            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                            
+                            if let Ok(status) = config.app_state.rpc_client.get_signature_status(&signature) {
+                                if let Some(result) = status {
+                                    if result.is_ok() {
+                                        logger.log(format!("Versioned swap transaction confirmed: {}", signature));
+                                        return Ok(signature.to_string());
+                                    } else {
+                                        return Err(format!("Transaction failed: {:?}", result));
+                                    }
+                                }
+                            }
+                        }
+                        
+                        return Err("Transaction confirmation timeout".to_string());
+                    },
+                    Err(e) => {
+                        logger.log(format!("Versioned swap attempt {}/{} failed: {}", attempts, max_attempts, e).red().to_string());
+                        
+                        if attempts >= max_attempts {
+                            return Err(format!("All versioned swap attempts failed. Last error: {}", e));
+                        }
+                        
+                        // Wait before retry
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                     }
-                    
-                    // Wait before retry
-                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                 }
             }
         }
@@ -830,10 +890,10 @@ async fn execute_swap_transaction(
         while attempts < max_attempts {
             attempts += 1;
             
-            // Send the transaction
-            match config.app_state.rpc_client.send_transaction(&transaction) {
+            // Send the transaction using zeroslot for minimal latency
+            match config.app_state.zeroslot_rpc_client.send_transaction(&transaction).await {
                 Ok(signature) => {
-                    logger.log(format!("Swap transaction sent: {}", signature));
+                    logger.log(format!("Swap transaction sent via zeroslot: {}", signature));
                     
                     // Wait for confirmation
                     for _ in 0..30 { // Wait up to 30 seconds for confirmation
@@ -1005,19 +1065,20 @@ async fn main() {
     println!("{}", run_msg);
     
     // Initialize blockhash processor
-    match BlockhashProcessor::new(config.app_state.rpc_client.clone()).await {
+    let blockhash_processor = match BlockhashProcessor::new(config.app_state.rpc_client.clone()).await {
         Ok(processor) => {
             if let Err(e) = processor.start().await {
                 eprintln!("Failed to start blockhash processor: {}", e);
                 return;
             }
             println!("Blockhash processor started successfully");
+            processor
         },
         Err(e) => {
             eprintln!("Failed to initialize blockhash processor: {}", e);
             return;
         }
-    }
+    };
 
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
@@ -1087,6 +1148,36 @@ async fn main() {
                 },
                 Err(e) => {
                     eprintln!("Failed to sell all tokens: {}", e);
+                    return;
+                }
+            }
+        } else if args.contains(&"--balance".to_string()) {
+            println!("Checking and managing SOL/WSOL balance...");
+            
+            use solana_vntr_sniper::services::balance_manager::BalanceManager;
+            let balance_manager = BalanceManager::new(Arc::new(config.app_state.clone()));
+            
+            match balance_manager.get_current_balances().await {
+                Ok(balance_info) => {
+                    println!("Current balances:");
+                    println!("  SOL:   {:.6}", balance_info.sol_balance);
+                    println!("  WSOL:  {:.6}", balance_info.wsol_balance);
+                    println!("  Total: {:.6}", balance_info.total_balance);
+                    println!("  Ratio: {:.2}", balance_info.balance_ratio);
+                    
+                    if balance_manager.needs_rebalancing(&balance_info) {
+                        println!("\nRebalancing needed! Performing automatic rebalancing...");
+                        match balance_manager.rebalance().await {
+                            Ok(_) => println!("✅ Rebalancing completed successfully!"),
+                            Err(e) => eprintln!("❌ Rebalancing failed: {}", e),
+                        }
+                    } else {
+                        println!("\n✅ Balances are well balanced - no action needed");
+                    }
+                    return;
+                },
+                Err(e) => {
+                    eprintln!("Failed to check balances: {}", e);
                     return;
                 }
             }
