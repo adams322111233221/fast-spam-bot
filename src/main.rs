@@ -84,7 +84,7 @@ use solana_vntr_sniper::{
         copy_trading::{start_copy_trading, CopyTradingConfig},
         swap::SwapProtocol,
     },
-    services::{cache_maintenance, blockhash_processor::BlockhashProcessor, risk_management::RiskManagementService, periodic_seller::PeriodicSellerService},
+    services::{cache_maintenance, blockhash_processor::BlockhashProcessor, risk_management::RiskManagementService, periodic_seller::PeriodicSellerService, balance_monitor::BalanceMonitorService},
     core::token,
 };
 use solana_program_pack::Pack;
@@ -455,14 +455,14 @@ async fn close_all_token_accounts(config: &Config) -> Result<(), String> {
             &[&wallet_pubkey],
         ).map_err(|e| format!("Failed to create close instruction for {}: {}", token_account, e))?;
         
-        // Send transaction using zeroslot for minimal latency
-        let recent_blockhash = match solana_vntr_sniper::services::blockhash_processor::BlockhashProcessor::get_latest_blockhash().await {
-            Some(hash) => hash,
-            None => return Err(format!("Failed to get recent blockhash for token account {}", token_account)),
+        // Send transaction using normal RPC for token account closing
+        let recent_blockhash = match config.app_state.rpc_client.get_latest_blockhash() {
+            Ok(hash) => hash,
+            Err(e) => return Err(format!("Failed to get recent blockhash for token account {}: {}", token_account, e)),
         };
         
-        match solana_vntr_sniper::core::tx::new_signed_and_send_zeroslot(
-            config.app_state.zeroslot_rpc_client.clone(),
+        match solana_vntr_sniper::core::tx::new_signed_and_send_normal(
+            config.app_state.rpc_nonblocking_client.clone(),
             recent_blockhash,
             &config.app_state.wallet,
             vec![close_instruction],
@@ -1345,6 +1345,21 @@ async fn main() {
     });
     
     println!("Periodic selling service started (selling every 2 minutes)");
+    
+    // Create and start the balance monitoring service
+    let balance_monitor_service = BalanceMonitorService::new(
+        Arc::new(config.app_state.clone())
+    );
+    
+    // Start balance monitoring service in background
+    let balance_monitor_clone = balance_monitor_service.clone();
+    tokio::spawn(async move {
+        if let Err(e) = balance_monitor_clone.start_monitoring().await {
+            eprintln!("Balance monitoring error: {}", e);
+        }
+    });
+    
+    println!("Balance monitoring service started (checking every 2 minutes with must-selling)");
     
     // Start the copy trading bot
     if let Err(e) = start_copy_trading(copy_trading_config).await {
