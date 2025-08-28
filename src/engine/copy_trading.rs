@@ -3,6 +3,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 use anyhow::Result;
 use anchor_client::solana_sdk::signature::Signature;
+use bs58;
 use colored::Colorize;
 use tokio::time;
 use futures_util::stream::StreamExt;
@@ -10,7 +11,7 @@ use futures_util::{SinkExt, Sink};
 use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient};
 use yellowstone_grpc_proto::geyser::{
     subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest, SubscribeRequestPing,
-    SubscribeRequestFilterTransactions,  SubscribeUpdate,
+    SubscribeRequestFilterTransactions,  SubscribeUpdate, SubscribeUpdateTransaction,
 };
 use crate::engine::transaction_parser;
 use crate::common::{
@@ -276,6 +277,30 @@ async fn process_message(
     
     let mut target_signature = None;
     
+    // Helper: extract signer pubkeys from a Yellowstone transaction
+    fn extract_signers_from_txn(txn: &SubscribeUpdateTransaction) -> Vec<String> {
+        // Best-effort extraction using message header to determine signer count
+        let mut result: Vec<String> = Vec::new();
+        if let Some(txn_inner) = &txn.transaction {
+            if let Some(inner_tx) = &txn_inner.transaction {
+                if let Some(message) = &inner_tx.message {
+                    let signer_count: usize = message
+                        .header
+                        .as_ref()
+                        .map(|h| h.num_required_signatures as usize)
+                        .unwrap_or(1);
+                    let take = signer_count.min(message.account_keys.len());
+                    for i in 0..take {
+                        // Convert account key bytes to base58 string
+                        let key_b58 = bs58::encode(&message.account_keys[i]).into_string();
+                        result.push(key_b58);
+                    }
+                }
+            }
+        }
+        result
+    }
+
     // Handle transaction messages
     if let Some(UpdateOneof::Transaction(txn)) = &msg.update_oneof {
         // Extract transaction logs and account keys
@@ -298,11 +323,13 @@ async fn process_message(
         };
         
         if !inner_instructions.is_empty() {
+            // Compute signers (fee payer and any other signers)
+            let signers: Vec<String> = extract_signers_from_txn(txn);
             // Find inner instruction with data length of 368, 270, 266, or 146 (Raydium Launchpad)
             let cpi_log_data = inner_instructions
                 .iter()
                 .flat_map(|inner| &inner.instructions)
-                .find(|ix| ix.data.len() == 368 || ix.data.len() == 270 || ix.data.len() == 266 || ix.data.len() == 146)
+                .find(|ix| ix.data.len() == 368 || ix.data.len() == 270 || ix.data.len() == 266 || ix.data.len() == 155)
                 .map(|ix| ix.data.clone());
 
             if let Some(data) = cpi_log_data {
@@ -310,10 +337,11 @@ async fn process_message(
                 let logger = logger.clone();
                 let txn = txn.clone();
                 let parallel_processor = parallel_processor.clone();
+                let signers_clone = signers.clone();
                 
                 tokio::spawn(async move {
                     if let Some(parsed_data) = crate::engine::transaction_parser::parse_transaction_data(&txn, &data) {
-                        let _ = handle_parsed_data(parsed_data, config, target_signature, &logger, &parallel_processor).await;
+                        let _ = handle_parsed_data(parsed_data, config, target_signature, &logger, &parallel_processor, signers_clone).await;
                     }
                 });
             }
@@ -331,6 +359,7 @@ async fn handle_parsed_data(
     target_signature: Option<Signature>,
     logger: &Logger,
     parallel_processor: &ParallelTransactionProcessor,
+    signers: Vec<String>,
 ) -> Result<(), String> {
     let start_time = Instant::now();
     let instruction_type = parsed_data.dex_type.clone();
@@ -395,6 +424,15 @@ async fn handle_parsed_data(
             }
         }
     } else {
+        // For sells, require that a signer matches one of the configured target addresses
+        let signer_is_target = !signers.is_empty() && signers.iter().any(|s| config.target_addresses.iter().any(|t| t == s));
+        if !signer_is_target {
+            logger.log(format!(
+                "Skipping SELL for {}: signer(s) {:?} do not match target addresses",
+                mint, signers
+            ).yellow().to_string());
+            return Ok(());
+        }
         // Submit sell operation to parallel processor (non-blocking with must-selling)
         logger.log(format!("🚀 Submitting SELL operation to parallel processor for token: {}", mint).red().to_string());
         
