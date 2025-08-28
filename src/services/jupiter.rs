@@ -203,7 +203,7 @@ impl JupiterClient {
             quote_response: quote,
             user_public_key: user_public_key.to_string(),
             wrap_and_unwrap_sol: true,
-            dynamic_compute_unit_limit: true,
+            dynamic_compute_unit_limit: false, 
             prioritization_fee_lamports: PrioritizationFee {
                 priority_level_with_max_lamports: PriorityLevel {
                     max_lamports: 1_000_000, // 0.001 SOL max priority fee

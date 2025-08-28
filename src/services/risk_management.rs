@@ -439,7 +439,7 @@ impl RiskManagementService {
             quote_response: quote,
             user_public_key: user_public_key.to_string(),
             wrap_and_unwrap_sol: true,
-            dynamic_compute_unit_limit: true,
+            dynamic_compute_unit_limit: false, 
             prioritization_fee_lamports: PrioritizationFeeLamports {
                 priority_level_with_max_lamports: PriorityLevelWithMaxLamports {
                     max_lamports: 1000000,
