@@ -338,20 +338,32 @@ impl PumpSwap {
         // Get the correct token program for the mint
         let token_program = self.get_token_program(&mint).await.unwrap_or(*TOKEN_PROGRAM);
         
-        // Check token account existence without RPC call if possible
-        if !self.check_token_account_cache(out_ata).await {
+        println!("Preparing buy swap - Token ATA: {}, WSOL ATA: {}, Token Program: {}", 
+            out_ata, get_associated_token_address(&owner, &SOL_MINT), token_program);
+        
+        // Always check if token account exists and create if needed
+        // The cache might not contain all user accounts, so we need to be more robust
+        let token_account_exists = self.check_token_account_cache(out_ata).await;
+        if !token_account_exists {
+            println!("Creating token ATA for mint: {} at address: {}", mint, out_ata);
+            // Add ATA creation instruction - this ensures the token account exists
             instructions.push(create_associated_token_account_idempotent(
                 &owner,
                 &owner,
                 &mint,
                 &token_program,
             ));
+            // Cache the account for future use
             self.cache_token_account(out_ata).await;
+        } else {
+            println!("Token ATA already exists in cache: {}", out_ata);
         }
         
-        // Check if WSOL account exists for buying (WSOL always uses TOKEN_PROGRAM)
+        // Always check if WSOL account exists for buying (WSOL always uses TOKEN_PROGRAM)
         let wsol_ata = get_associated_token_address(&owner, &SOL_MINT);
-        if !self.check_token_account_cache(wsol_ata).await {
+        let wsol_account_exists = self.check_token_account_cache(wsol_ata).await;
+        if !wsol_account_exists {
+            println!("Creating WSOL ATA at address: {}", wsol_ata);
             instructions.push(create_associated_token_account_idempotent(
                 &owner,
                 &owner,
@@ -359,7 +371,11 @@ impl PumpSwap {
                 &TOKEN_PROGRAM,
             ));
             self.cache_token_account(wsol_ata).await;
+        } else {
+            println!("WSOL ATA already exists in cache: {}", wsol_ata);
         }
+        
+        println!("Total instructions before swap: {} (ATA creation + swap)", instructions.len());
         
         // Create accounts using parsed pool_id and coin_creator
         let pool_base_account = get_associated_token_address(&pool_id, &mint);
@@ -401,9 +417,28 @@ impl PumpSwap {
     ) -> Result<(u64, u64, Vec<AccountMeta>)> {
         let in_ata = get_associated_token_address(&owner, &mint);
         
+        println!("Preparing sell swap - Token ATA: {}, WSOL ATA: {}", 
+            in_ata, get_associated_token_address(&owner, &SOL_MINT));
+        
         // Verify token account exists using cache first
         if !self.check_token_account_cache(in_ata).await {
             return Err(anyhow!("Token account does not exist"));
+        }
+        
+        // Ensure WSOL account exists for receiving SOL from sell
+        let wsol_ata = get_associated_token_address(&owner, &SOL_MINT);
+        let wsol_account_exists = self.check_token_account_cache(wsol_ata).await;
+        if !wsol_account_exists {
+            println!("Creating WSOL ATA for sell at address: {}", wsol_ata);
+            instructions.push(create_associated_token_account_idempotent(
+                &owner,
+                &owner,
+                &SOL_MINT,
+                &TOKEN_PROGRAM,
+            ));
+            self.cache_token_account(wsol_ata).await;
+        } else {
+            println!("WSOL ATA already exists in cache: {}", wsol_ata);
         }
         
         // Get token info in parallel
@@ -472,6 +507,8 @@ impl PumpSwap {
             user_volume_accumulator,
         )?;
         
+        println!("Total instructions before sell swap: {} (WSOL ATA creation + close account if 100% + sell)", instructions.len());
+        
         Ok((amount, min_quote_amount_out, accounts))
     }
 
@@ -491,6 +528,25 @@ impl PumpSwap {
     ) -> Result<(u64, u64, Vec<AccountMeta>)> {
         let in_ata = get_associated_token_address(&owner, &mint);
         let (balance_raw, token_decimals) = cached_balance;
+        
+        println!("Preparing sell swap with cached balance - Token ATA: {}, WSOL ATA: {}", 
+            in_ata, get_associated_token_address(&owner, &SOL_MINT));
+        
+        // Ensure WSOL account exists for receiving SOL from sell
+        let wsol_ata = get_associated_token_address(&owner, &SOL_MINT);
+        let wsol_account_exists = self.check_token_account_cache(wsol_ata).await;
+        if !wsol_account_exists {
+            println!("Creating WSOL ATA for sell with cached balance at address: {}", wsol_ata);
+            instructions.push(create_associated_token_account_idempotent(
+                &owner,
+                &owner,
+                &SOL_MINT,
+                &TOKEN_PROGRAM,
+            ));
+            self.cache_token_account(wsol_ata).await;
+        } else {
+            println!("WSOL ATA already exists in cache: {}", wsol_ata);
+        }
         
         // Calculate amount to sell from cached balance
         let amount = match in_type {
@@ -554,12 +610,19 @@ impl PumpSwap {
             user_volume_accumulator,
         )?;
         
+        println!("Total instructions before sell swap with cached balance: {} (WSOL ATA creation + close account if 100% + sell)", instructions.len());
+        
         // Return token amount in and min SOL amount out for sell orders
         Ok((amount, min_quote_amount_out, accounts))
     }
     
     async fn check_token_account_cache(&self, account: Pubkey) -> bool {
-        WALLET_TOKEN_ACCOUNTS.contains(&account)
+        let exists = WALLET_TOKEN_ACCOUNTS.contains(&account);
+        if !exists {
+            // Log when cache miss occurs to help with debugging
+            println!("Cache miss for token account: {} - will create ATA", account);
+        }
+        exists
     }
     
     async fn cache_token_account(&self, account: Pubkey) {
@@ -586,6 +649,48 @@ impl PumpSwap {
             // Default to TOKEN_PROGRAM if no RPC client
             Ok(*TOKEN_PROGRAM)
         }
+    }
+    
+    /// Populate cache with existing token accounts for the user
+    /// This helps reduce unnecessary ATA creation instructions
+    pub async fn populate_token_account_cache(&self, owner: &Pubkey) -> Result<()> {
+        if let Some(rpc_client) = &self.rpc_client {
+            // Get all token accounts for the user
+            let accounts = rpc_client.get_token_accounts_by_owner(
+                owner,
+                anchor_client::solana_client::rpc_config::RpcAccountInfoConfig {
+                    encoding: Some(anchor_client::solana_client::rpc_config::UiAccountEncoding::Base64),
+                    ..Default::default()
+                },
+            )?;
+            
+            for account in accounts {
+                if let Ok(account_data) = account.account.decode() {
+                    if let Some(token_account) = account_data {
+                        // Cache the token account address
+                        self.cache_token_account(token_account.pubkey).await;
+                        println!("Cached existing token account: {}", token_account.pubkey);
+                    }
+                }
+            }
+            
+            // Also cache WSOL account if it exists
+            let wsol_ata = get_associated_token_address(owner, &SOL_MINT);
+            if let Ok(wsol_account) = rpc_client.get_account(&wsol_ata) {
+                if wsol_account.owner == *TOKEN_PROGRAM {
+                    self.cache_token_account(wsol_ata).await;
+                    println!("Cached existing WSOL account: {}", wsol_ata);
+                }
+            }
+        }
+        Ok(())
+    }
+    
+    /// Manually populate the cache for the current user
+    /// Call this method after creating a PumpSwap instance to populate the cache
+    pub async fn populate_cache_for_current_user(&self) -> Result<()> {
+        let owner = self.keypair.pubkey();
+        self.populate_token_account_cache(&owner).await
     }
 
     /// Calculate token amount out for buy using virtual reserves (PumpSwap AMM formula)
