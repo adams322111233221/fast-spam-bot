@@ -655,24 +655,32 @@ impl PumpSwap {
     /// This helps reduce unnecessary ATA creation instructions
     pub async fn populate_token_account_cache(&self, owner: &Pubkey) -> Result<()> {
         if let Some(rpc_client) = &self.rpc_client {
-            // Get all token accounts for the user
-            let accounts = rpc_client.get_token_accounts_by_owner(
+            // Query SPL Token program accounts
+            let mut cached_count: usize = 0;
+            let accounts_spl = rpc_client.get_token_accounts_by_owner(
                 owner,
-                anchor_client::solana_client::rpc_config::RpcAccountInfoConfig {
-                    encoding: Some(anchor_client::solana_client::rpc_config::UiAccountEncoding::Base64),
-                    ..Default::default()
-                },
+                anchor_client::solana_client::rpc_client::TokenAccountsFilter::ProgramId(*TOKEN_PROGRAM),
             )?;
-            
-            for account in accounts {
-                if let Ok(account_data) = account.account.decode() {
-                    if let Some(token_account) = account_data {
-                        // Cache the token account address
-                        self.cache_token_account(token_account.pubkey).await;
-                        println!("Cached existing token account: {}", token_account.pubkey);
-                    }
+            for keyed in &accounts_spl {
+                if let Ok(pk) = Pubkey::from_str(&keyed.pubkey) {
+                    self.cache_token_account(pk).await;
+                    cached_count += 1;
                 }
             }
+
+            // Query Token-2022 program accounts as well
+            let accounts_2022 = rpc_client.get_token_accounts_by_owner(
+                owner,
+                anchor_client::solana_client::rpc_client::TokenAccountsFilter::ProgramId(*TOKEN_2022_PROGRAM),
+            ).unwrap_or_default();
+            for keyed in &accounts_2022 {
+                if let Ok(pk) = Pubkey::from_str(&keyed.pubkey) {
+                    self.cache_token_account(pk).await;
+                    cached_count += 1;
+                }
+            }
+
+            println!("Cached {} existing token accounts for owner {}", cached_count, owner);
             
             // Also cache WSOL account if it exists
             let wsol_ata = get_associated_token_address(owner, &SOL_MINT);
