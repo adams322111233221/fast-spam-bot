@@ -2,6 +2,7 @@ use std::{str::FromStr, sync::Arc};
 use solana_program_pack::Pack;
 use anchor_client::solana_client::rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
 use anchor_client::solana_client::rpc_filter::{Memcmp, MemcmpEncodedBytes, RpcFilterType};
+use anchor_client::solana_client::rpc_request::TokenAccountsFilter;
 use solana_account_decoder::UiAccountEncoding;
 use anyhow::{anyhow, Result};
 use colored::Colorize;
@@ -175,10 +176,22 @@ impl PumpSwap {
         logger.log(format!("Using parsed data - Pool: {}, Coin Creator: {}, Virtual SOL: {}, Virtual Tokens: {}, Price: {}", 
             pool_id, coin_creator, trade_info.virtual_sol_reserves, trade_info.virtual_token_reserves, token_price));
         
-        // Prepare swap parameters
+        // Prepare swap parameters with reverse logic for discriminator
         let (_token_in, _token_out, discriminator) = match swap_config.swap_direction {
-            SwapDirection::Buy => (*SOL_MINT, mint, *BUY_DISCRIMINATOR),
-            SwapDirection::Sell => (mint, *SOL_MINT, *SELL_DISCRIMINATOR),
+            SwapDirection::Buy => {
+                if trade_info.is_reverse_when_pump_swap {
+                    (*SOL_MINT, mint, *SELL_DISCRIMINATOR)
+                } else {
+                    (*SOL_MINT, mint, *BUY_DISCRIMINATOR)
+                }
+            },
+            SwapDirection::Sell => {
+                if trade_info.is_reverse_when_pump_swap {
+                    (mint, *SOL_MINT, *BUY_DISCRIMINATOR)
+                } else {
+                    (mint, *SOL_MINT, *SELL_DISCRIMINATOR)
+                }
+            },
         };
         
         let mut instructions = Vec::with_capacity(3); // Pre-allocate for typical case
@@ -338,20 +351,32 @@ impl PumpSwap {
         // Get the correct token program for the mint
         let token_program = self.get_token_program(&mint).await.unwrap_or(*TOKEN_PROGRAM);
         
-        // Check token account existence without RPC call if possible
-        if !self.check_token_account_cache(out_ata).await {
+        println!("Preparing buy swap - Token ATA: {}, WSOL ATA: {}, Token Program: {}", 
+            out_ata, get_associated_token_address(&owner, &SOL_MINT), token_program);
+        
+        // Always check if token account exists and create if needed
+        // The cache might not contain all user accounts, so we need to be more robust
+        let token_account_exists = self.check_token_account_cache(out_ata).await;
+        if !token_account_exists {
+            println!("Creating token ATA for mint: {} at address: {}", mint, out_ata);
+            // Add ATA creation instruction - this ensures the token account exists
             instructions.push(create_associated_token_account_idempotent(
                 &owner,
                 &owner,
                 &mint,
                 &token_program,
             ));
+            // Cache the account for future use
             self.cache_token_account(out_ata).await;
+        } else {
+            println!("Token ATA already exists in cache: {}", out_ata);
         }
         
-        // Check if WSOL account exists for buying (WSOL always uses TOKEN_PROGRAM)
+        // Always check if WSOL account exists for buying (WSOL always uses TOKEN_PROGRAM)
         let wsol_ata = get_associated_token_address(&owner, &SOL_MINT);
-        if !self.check_token_account_cache(wsol_ata).await {
+        let wsol_account_exists = self.check_token_account_cache(wsol_ata).await;
+        if !wsol_account_exists {
+            println!("Creating WSOL ATA at address: {}", wsol_ata);
             instructions.push(create_associated_token_account_idempotent(
                 &owner,
                 &owner,
@@ -359,7 +384,33 @@ impl PumpSwap {
                 &TOKEN_PROGRAM,
             ));
             self.cache_token_account(wsol_ata).await;
+        } else {
+            println!("WSOL ATA already exists in cache: {}", wsol_ata);
         }
+        
+        // Ensure fee recipient WSOL ATA exists (program expects it initialized)
+        let fee_recipient_ata = get_associated_token_address(&PUMP_SWAP_FEE_RECIPIENT, &SOL_MINT);
+        instructions.push(create_associated_token_account_idempotent(
+            &owner,
+            &PUMP_SWAP_FEE_RECIPIENT,
+            &SOL_MINT,
+            &TOKEN_PROGRAM,
+        ));
+        
+        // Ensure coin creator vault authority WSOL ATA exists
+        let (coin_creator_vault_authority, _) = Pubkey::find_program_address(
+            &[b"creator_vault", coin_creator.as_ref()],
+            &PUMP_SWAP_PROGRAM,
+        );
+        let coin_creator_vault_ata = get_associated_token_address(&coin_creator_vault_authority, &SOL_MINT);
+        instructions.push(create_associated_token_account_idempotent(
+            &owner,
+            &coin_creator_vault_authority,
+            &SOL_MINT,
+            &TOKEN_PROGRAM,
+        ));
+        
+        println!("Total instructions before swap: {} (ATA creation + swap)", instructions.len());
         
         // Create accounts using parsed pool_id and coin_creator
         let pool_base_account = get_associated_token_address(&pool_id, &mint);
@@ -369,6 +420,7 @@ impl PumpSwap {
         let global_volume_accumulator = get_global_volume_accumulator_pda()?;
         let user_volume_accumulator = get_user_volume_accumulator_pda(&owner)?;
         
+
         let accounts = create_buy_accounts(
             pool_id,
             owner,
@@ -381,7 +433,9 @@ impl PumpSwap {
             coin_creator,
             global_volume_accumulator,
             user_volume_accumulator,
+            trade_info.is_reverse_when_pump_swap,
         )?;
+
         
         // Return token amount out and max SOL amount in for buy orders
         Ok((base_amount_out, max_quote_amount_in, accounts))
@@ -401,10 +455,51 @@ impl PumpSwap {
     ) -> Result<(u64, u64, Vec<AccountMeta>)> {
         let in_ata = get_associated_token_address(&owner, &mint);
         
+        println!("Preparing sell swap - Token ATA: {}, WSOL ATA: {}", 
+            in_ata, get_associated_token_address(&owner, &SOL_MINT));
+        
         // Verify token account exists using cache first
         if !self.check_token_account_cache(in_ata).await {
             return Err(anyhow!("Token account does not exist"));
         }
+        
+        // Ensure WSOL account exists for receiving SOL from sell
+        let wsol_ata = get_associated_token_address(&owner, &SOL_MINT);
+        let wsol_account_exists = self.check_token_account_cache(wsol_ata).await;
+        if !wsol_account_exists {
+            println!("Creating WSOL ATA for sell at address: {}", wsol_ata);
+            instructions.push(create_associated_token_account_idempotent(
+                &owner,
+                &owner,
+                &SOL_MINT,
+                &TOKEN_PROGRAM,
+            ));
+            self.cache_token_account(wsol_ata).await;
+        } else {
+            println!("WSOL ATA already exists in cache: {}", wsol_ata);
+        }
+        
+        // Ensure fee recipient WSOL ATA exists
+        let fee_recipient_ata = get_associated_token_address(&PUMP_SWAP_FEE_RECIPIENT, &SOL_MINT);
+        instructions.push(create_associated_token_account_idempotent(
+            &owner,
+            &PUMP_SWAP_FEE_RECIPIENT,
+            &SOL_MINT,
+            &TOKEN_PROGRAM,
+        ));
+        
+        // Ensure coin creator vault authority WSOL ATA exists
+        let (coin_creator_vault_authority, _) = Pubkey::find_program_address(
+            &[b"creator_vault", coin_creator.as_ref()],
+            &PUMP_SWAP_PROGRAM,
+        );
+        let coin_creator_vault_ata = get_associated_token_address(&coin_creator_vault_authority, &SOL_MINT);
+        instructions.push(create_associated_token_account_idempotent(
+            &owner,
+            &coin_creator_vault_authority,
+            &SOL_MINT,
+            &TOKEN_PROGRAM,
+        ));
         
         // Get token info in parallel
         let (account_info, mint_info) = if let Some(client) = &self.rpc_nonblocking_client {
@@ -470,7 +565,10 @@ impl PumpSwap {
             coin_creator,
             global_volume_accumulator,
             user_volume_accumulator,
+            trade_info.is_reverse_when_pump_swap,
         )?;
+        
+        println!("Total instructions before sell swap: {} (WSOL ATA creation + close account if 100% + sell)", instructions.len());
         
         Ok((amount, min_quote_amount_out, accounts))
     }
@@ -491,6 +589,47 @@ impl PumpSwap {
     ) -> Result<(u64, u64, Vec<AccountMeta>)> {
         let in_ata = get_associated_token_address(&owner, &mint);
         let (balance_raw, token_decimals) = cached_balance;
+        
+        println!("Preparing sell swap with cached balance - Token ATA: {}, WSOL ATA: {}", 
+            in_ata, get_associated_token_address(&owner, &SOL_MINT));
+        
+        // Ensure WSOL account exists for receiving SOL from sell
+        let wsol_ata = get_associated_token_address(&owner, &SOL_MINT);
+        let wsol_account_exists = self.check_token_account_cache(wsol_ata).await;
+        if !wsol_account_exists {
+            println!("Creating WSOL ATA for sell with cached balance at address: {}", wsol_ata);
+            instructions.push(create_associated_token_account_idempotent(
+                &owner,
+                &owner,
+                &SOL_MINT,
+                &TOKEN_PROGRAM,
+            ));
+            self.cache_token_account(wsol_ata).await;
+        } else {
+            println!("WSOL ATA already exists in cache: {}", wsol_ata);
+        }
+        
+        // Ensure fee recipient WSOL ATA exists
+        let fee_recipient_ata = get_associated_token_address(&PUMP_SWAP_FEE_RECIPIENT, &SOL_MINT);
+        instructions.push(create_associated_token_account_idempotent(
+            &owner,
+            &PUMP_SWAP_FEE_RECIPIENT,
+            &SOL_MINT,
+            &TOKEN_PROGRAM,
+        ));
+        
+        // Ensure coin creator vault authority WSOL ATA exists
+        let (coin_creator_vault_authority, _) = Pubkey::find_program_address(
+            &[b"creator_vault", coin_creator.as_ref()],
+            &PUMP_SWAP_PROGRAM,
+        );
+        let coin_creator_vault_ata = get_associated_token_address(&coin_creator_vault_authority, &SOL_MINT);
+        instructions.push(create_associated_token_account_idempotent(
+            &owner,
+            &coin_creator_vault_authority,
+            &SOL_MINT,
+            &TOKEN_PROGRAM,
+        ));
         
         // Calculate amount to sell from cached balance
         let amount = match in_type {
@@ -552,14 +691,22 @@ impl PumpSwap {
             coin_creator,
             global_volume_accumulator,
             user_volume_accumulator,
+            trade_info.is_reverse_when_pump_swap,
         )?;
+        
+        println!("Total instructions before sell swap with cached balance: {} (WSOL ATA creation + close account if 100% + sell)", instructions.len());
         
         // Return token amount in and min SOL amount out for sell orders
         Ok((amount, min_quote_amount_out, accounts))
     }
     
     async fn check_token_account_cache(&self, account: Pubkey) -> bool {
-        WALLET_TOKEN_ACCOUNTS.contains(&account)
+        let exists = WALLET_TOKEN_ACCOUNTS.contains(&account);
+        if !exists {
+            // Log when cache miss occurs to help with debugging
+            println!("Cache miss for token account: {} - will create ATA", account);
+        }
+        exists
     }
     
     async fn cache_token_account(&self, account: Pubkey) {
@@ -586,6 +733,56 @@ impl PumpSwap {
             // Default to TOKEN_PROGRAM if no RPC client
             Ok(*TOKEN_PROGRAM)
         }
+    }
+    
+    /// Populate cache with existing token accounts for the user
+    /// This helps reduce unnecessary ATA creation instructions
+    pub async fn populate_token_account_cache(&self, owner: &Pubkey) -> Result<()> {
+        if let Some(rpc_client) = &self.rpc_client {
+            // Query SPL Token program accounts
+            let mut cached_count: usize = 0;
+            let accounts_spl = rpc_client.get_token_accounts_by_owner(
+                owner,
+                TokenAccountsFilter::ProgramId(*TOKEN_PROGRAM),
+            )?;
+            for keyed in &accounts_spl {
+                if let Ok(pk) = Pubkey::from_str(&keyed.pubkey) {
+                    self.cache_token_account(pk).await;
+                    cached_count += 1;
+                }
+            }
+
+            // Query Token-2022 program accounts as well
+            let accounts_2022 = rpc_client.get_token_accounts_by_owner(
+                owner,
+                TokenAccountsFilter::ProgramId(*TOKEN_2022_PROGRAM),
+            ).unwrap_or_default();
+            for keyed in &accounts_2022 {
+                if let Ok(pk) = Pubkey::from_str(&keyed.pubkey) {
+                    self.cache_token_account(pk).await;
+                    cached_count += 1;
+                }
+            }
+
+            println!("Cached {} existing token accounts for owner {}", cached_count, owner);
+            
+            // Also cache WSOL account if it exists
+            let wsol_ata = get_associated_token_address(owner, &SOL_MINT);
+            if let Ok(wsol_account) = rpc_client.get_account(&wsol_ata) {
+                if wsol_account.owner == *TOKEN_PROGRAM {
+                    self.cache_token_account(wsol_ata).await;
+                    println!("Cached existing WSOL account: {}", wsol_ata);
+                }
+            }
+        }
+        Ok(())
+    }
+    
+    /// Manually populate the cache for the current user
+    /// Call this method after creating a PumpSwap instance to populate the cache
+    pub async fn populate_cache_for_current_user(&self) -> Result<()> {
+        let owner = self.keypair.pubkey();
+        self.populate_token_account_cache(&owner).await
     }
 
     /// Calculate token amount out for buy using virtual reserves (PumpSwap AMM formula)
@@ -797,6 +994,7 @@ fn create_buy_accounts(
     coin_creator: Pubkey,
     global_volume_accumulator: Pubkey,
     user_volume_accumulator: Pubkey,
+    is_reverse_when_pump_swap: bool,
 ) -> Result<Vec<AccountMeta>> {
     let (coin_creator_vault_authority, _) = Pubkey::find_program_address(
         &[b"creator_vault", coin_creator.as_ref()],
@@ -806,6 +1004,18 @@ fn create_buy_accounts(
     
     // For buy (normal case): user spends SOL to get tokens
     // User spends from wsol_account and receives to user_base_token_account
+    let (user_base_token_account, wsol_account) = if is_reverse_when_pump_swap {
+        (wsol_account, user_base_token_account)
+    } else {
+        (user_base_token_account, wsol_account)
+    };
+
+    let (base_mint, quote_mint) = if is_reverse_when_pump_swap {
+        (quote_mint, base_mint)
+    } else {
+        (base_mint, quote_mint)
+    };
+    
     Ok(vec![
         AccountMeta::new_readonly(pool_id, false),
         AccountMeta::new(user, true),
@@ -844,6 +1054,7 @@ fn create_sell_accounts(
     coin_creator: Pubkey,
     global_volume_accumulator: Pubkey,
     user_volume_accumulator: Pubkey,
+    is_reverse_when_pump_swap: bool,
 ) -> Result<Vec<AccountMeta>> {
 
     let (coin_creator_vault_authority, _) = Pubkey::find_program_address(
@@ -854,6 +1065,18 @@ fn create_sell_accounts(
 
     // For sell (reverse case): user account order is swapped compared to buy
     // User is selling tokens (base_mint) to get SOL (quote_mint)
+    let (user_base_token_account, wsol_account) = if is_reverse_when_pump_swap {
+        (wsol_account, user_base_token_account)
+    } else {
+        (user_base_token_account, wsol_account)
+    };
+
+    let (base_mint, quote_mint) = if is_reverse_when_pump_swap {
+        (quote_mint, base_mint)
+    } else {
+        (base_mint, quote_mint)
+    };
+
     Ok(vec![
         AccountMeta::new_readonly(pool_id, false),
         AccountMeta::new(user, true),
