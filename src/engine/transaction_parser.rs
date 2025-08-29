@@ -114,21 +114,12 @@ pub fn parse_transaction_data(txn: &SubscribeUpdateTransaction, buffer: &[u8]) -
         // Try to extract from token balances if txn is available
         if let Some(tx_inner) = &txn.transaction {
             if let Some(meta) = &tx_inner.meta {
-                // Check post token balances
+                // Find the first mint that is not WSOL
                 if !meta.post_token_balances.is_empty() {
-                    mint = meta.post_token_balances[0].mint.clone();
-                    
-                    // Check if this is a reverse case (WSOL is the first mint)
-                if mint == "So11111111111111111111111111111111111111112" {
-                        // In reverse case, look for the second mint which should be the token
-                        if meta.post_token_balances.len() > 1 {
-                            mint = meta.post_token_balances[1].mint.clone();
-                            if mint == "So11111111111111111111111111111111111111112" {
-                                // In reverse case, look for the second mint which should be the token
-                                if meta.post_token_balances.len() > 2 {
-                                    mint = meta.post_token_balances[2].mint.clone();
-                                }
-                            }
+                    for token_balance in &meta.post_token_balances {
+                        if token_balance.mint != "So11111111111111111111111111111111111111112" {
+                            mint = token_balance.mint.clone();
+                            break;
                         }
                     }
                 }
@@ -402,7 +393,7 @@ pub fn parse_transaction_data(txn: &SubscribeUpdateTransaction, buffer: &[u8]) -
             })
         },
         
-        146 => { // Raydium Launchpad - process all buy transactions
+        155 => { // Raydium Launchpad - process all buy transactions
             let pool_id = parse_public_key(buffer, 16)?;
             let virtual_base_reserve = parse_u64(buffer, 56)?;
             let virtual_quote_reserve = parse_u64(buffer, 64)?;
