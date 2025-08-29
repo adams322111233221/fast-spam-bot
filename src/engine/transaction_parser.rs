@@ -166,11 +166,11 @@ pub fn parse_transaction_data(txn: &SubscribeUpdateTransaction, buffer: &[u8]) -
                 let temp_price = pool_base_token_reserves.saturating_mul(1_000_000_000) / pool_quote_token_reserves.max(1);
                 if temp_price < 1 {
                     // In reverse case: poolBaseTokenReserves/poolQuoteTokenReserves (base_mint is WSOL)
-                    (temp_price, false)
+                    (temp_price, true)
                 } else {
                     // Normal case: poolQuoteTokenReserves/poolBaseTokenReserves (quote_mint is WSOL)
                     let normal_price = pool_quote_token_reserves.saturating_mul(1_000_000_000) / pool_base_token_reserves.max(1);
-                    (normal_price, true)
+                    (normal_price, false)
                 }
             } else {
                 // Normal case: poolQuoteTokenReserves/poolBaseTokenReserves (quote_mint is WSOL)
