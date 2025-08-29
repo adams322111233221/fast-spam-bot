@@ -18,7 +18,6 @@ use spl_associated_token_account::{
     get_associated_token_address,
     instruction::create_associated_token_account_idempotent
 };
-use solana_client::rpc_request::TokenAccountsFilter;
 use spl_token::ui_amount_to_amount;
 use tokio::sync::OnceCell;
 use lru::LruCache;
@@ -661,7 +660,7 @@ impl PumpSwap {
             let mut cached_count: usize = 0;
             let accounts_spl = rpc_client.get_token_accounts_by_owner(
                 owner,
-                anchor_client::solana_client::rpc_client::TokenAccountsFilter::ProgramId(*TOKEN_PROGRAM),
+                TokenAccountsFilter::ProgramId(*TOKEN_PROGRAM),
             )?;
             for keyed in &accounts_spl {
                 if let Ok(pk) = Pubkey::from_str(&keyed.pubkey) {
@@ -673,7 +672,7 @@ impl PumpSwap {
             // Query Token-2022 program accounts as well
             let accounts_2022 = rpc_client.get_token_accounts_by_owner(
                 owner,
-                anchor_client::solana_client::rpc_client::TokenAccountsFilter::ProgramId(*TOKEN_2022_PROGRAM),
+                TokenAccountsFilter::ProgramId(*TOKEN_2022_PROGRAM),
             ).unwrap_or_default();
             for keyed in &accounts_2022 {
                 if let Ok(pk) = Pubkey::from_str(&keyed.pubkey) {
