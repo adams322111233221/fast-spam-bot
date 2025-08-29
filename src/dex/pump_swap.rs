@@ -420,6 +420,7 @@ impl PumpSwap {
             coin_creator,
             global_volume_accumulator,
             user_volume_accumulator,
+            trade_info.is_reverse_when_pump_swap,
         )?;
         
         // Return token amount out and max SOL amount in for buy orders
@@ -550,6 +551,7 @@ impl PumpSwap {
             coin_creator,
             global_volume_accumulator,
             user_volume_accumulator,
+            trade_info.is_reverse_when_pump_swap,
         )?;
         
         println!("Total instructions before sell swap: {} (WSOL ATA creation + close account if 100% + sell)", instructions.len());
@@ -675,6 +677,7 @@ impl PumpSwap {
             coin_creator,
             global_volume_accumulator,
             user_volume_accumulator,
+            trade_info.is_reverse_when_pump_swap,
         )?;
         
         println!("Total instructions before sell swap with cached balance: {} (WSOL ATA creation + close account if 100% + sell)", instructions.len());
@@ -977,6 +980,7 @@ fn create_buy_accounts(
     coin_creator: Pubkey,
     global_volume_accumulator: Pubkey,
     user_volume_accumulator: Pubkey,
+    is_reverse_when_pump_swap: bool,
 ) -> Result<Vec<AccountMeta>> {
     let (coin_creator_vault_authority, _) = Pubkey::find_program_address(
         &[b"creator_vault", coin_creator.as_ref()],
@@ -986,6 +990,18 @@ fn create_buy_accounts(
     
     // For buy (normal case): user spends SOL to get tokens
     // User spends from wsol_account and receives to user_base_token_account
+    let (user_base_token_account, wsol_account) = if is_reverse_when_pump_swap {
+        (wsol_account, user_base_token_account)
+    } else {
+        (user_base_token_account, wsol_account)
+    };
+
+    let (base_mint, quote_mint) = if is_reverse_when_pump_swap {
+        (quote_mint, base_mint)
+    } else {
+        (base_mint, quote_mint)
+    };
+    
     Ok(vec![
         AccountMeta::new_readonly(pool_id, false),
         AccountMeta::new(user, true),
@@ -1024,6 +1040,7 @@ fn create_sell_accounts(
     coin_creator: Pubkey,
     global_volume_accumulator: Pubkey,
     user_volume_accumulator: Pubkey,
+    is_reverse_when_pump_swap: bool,
 ) -> Result<Vec<AccountMeta>> {
 
     let (coin_creator_vault_authority, _) = Pubkey::find_program_address(
@@ -1034,6 +1051,18 @@ fn create_sell_accounts(
 
     // For sell (reverse case): user account order is swapped compared to buy
     // User is selling tokens (base_mint) to get SOL (quote_mint)
+    let (user_base_token_account, wsol_account) = if is_reverse_when_pump_swap {
+        (wsol_account, user_base_token_account)
+    } else {
+        (user_base_token_account, wsol_account)
+    };
+
+    let (base_mint, quote_mint) = if is_reverse_when_pump_swap {
+        (quote_mint, base_mint)
+    } else {
+        (base_mint, quote_mint)
+    };
+
     Ok(vec![
         AccountMeta::new_readonly(pool_id, false),
         AccountMeta::new(user, true),
