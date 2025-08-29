@@ -176,10 +176,22 @@ impl PumpSwap {
         logger.log(format!("Using parsed data - Pool: {}, Coin Creator: {}, Virtual SOL: {}, Virtual Tokens: {}, Price: {}", 
             pool_id, coin_creator, trade_info.virtual_sol_reserves, trade_info.virtual_token_reserves, token_price));
         
-        // Prepare swap parameters
+        // Prepare swap parameters with reverse logic for discriminator
         let (_token_in, _token_out, discriminator) = match swap_config.swap_direction {
-            SwapDirection::Buy => (*SOL_MINT, mint, *BUY_DISCRIMINATOR),
-            SwapDirection::Sell => (mint, *SOL_MINT, *SELL_DISCRIMINATOR),
+            SwapDirection::Buy => {
+                if trade_info.is_reverse_when_pump_swap {
+                    (*SOL_MINT, mint, *SELL_DISCRIMINATOR)
+                } else {
+                    (*SOL_MINT, mint, *BUY_DISCRIMINATOR)
+                }
+            },
+            SwapDirection::Sell => {
+                if trade_info.is_reverse_when_pump_swap {
+                    (mint, *SOL_MINT, *BUY_DISCRIMINATOR)
+                } else {
+                    (mint, *SOL_MINT, *SELL_DISCRIMINATOR)
+                }
+            },
         };
         
         let mut instructions = Vec::with_capacity(3); // Pre-allocate for typical case
@@ -408,6 +420,7 @@ impl PumpSwap {
         let global_volume_accumulator = get_global_volume_accumulator_pda()?;
         let user_volume_accumulator = get_user_volume_accumulator_pda(&owner)?;
         
+
         let accounts = create_buy_accounts(
             pool_id,
             owner,
@@ -422,6 +435,7 @@ impl PumpSwap {
             user_volume_accumulator,
             trade_info.is_reverse_when_pump_swap,
         )?;
+
         
         // Return token amount out and max SOL amount in for buy orders
         Ok((base_amount_out, max_quote_amount_in, accounts))
